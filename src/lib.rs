@@ -1,4 +1,4 @@
-//! Motor de Quantus de TokenMiner: CUDA (denso exacto y disperso Q106) y WGSL por wgpu.
+//! Motor de Quantus de TokenMiner: CUDA (denso exacto y disperso) y WGSL por wgpu.
 #[cfg(windows)]
 pub mod cuda;
 pub mod web;
