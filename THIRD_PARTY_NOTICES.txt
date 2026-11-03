@@ -1,0 +1,16 @@
+tokenminer-quantus · motor de Quantus de TokenMiner: atribuciones de terceros
+
+Este crate incorpora copias locales de los crates engine-gpu, engine-cpu y pow-core
+del minero oficial de Quantus Network (quantus-miner v4.2.0, commit c1cf0a37dce77f98df3c73c390f958d7efddaf85),
+en vendor/quantus-miner/, junto con su licencia Apache-2.0 (vendor/quantus-miner/LICENSE y
+licenses/quantus-miner-Apache-2.0.txt).
+
+La modificación de cálculo en esas copias permite seleccionar explícitamente el kernel oficial de 32 bits
+mediante la variable TOKENMINER_QUANTUS_FORCE_U32=1; el comportamiento predeterminado del minero oficial se
+conserva. Además se retiran dos declaraciones de benches cuyos archivos no formaban parte de la copia
+vendorizada. No se modifica la matemática del código oficial.
+
+Las constantes y la definición de Poseidon2 provienen de qp-poseidon-core 3.1.0 (Quantus Network, MIT);
+su licencia está en licenses/qp-poseidon-core-MIT.txt.
+
+Proyecto independiente: no está afiliado a Quantus Network.

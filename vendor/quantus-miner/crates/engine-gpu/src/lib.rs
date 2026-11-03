@@ -1,0 +1,1201 @@
+#![deny(rust_2018_idioms)]
+#![deny(unsafe_code)]
+
+mod gpu_tiers;
+mod kernels;
+
+pub mod end_to_end_tests;
+pub mod tests;
+
+pub use kernels::Kernel;
+
+use engine_cpu::{CancelCheck, Candidate, EngineStatus, FoundOrigin, MinerEngine, Range};
+use pow_core::{format_hashrate, format_u512, JobContext};
+use primitive_types::U512;
+use std::cell::RefCell;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+
+/// Represents a single GPU device context.
+struct GpuContext {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pipeline: wgpu::ComputePipeline,
+
+    input_usage: wgpu::BufferUsages,
+
+    // Cached vendor configuration
+    optimal_workgroups: u32,
+}
+
+#[derive(Clone)]
+struct GpuResources {
+    midstate_buffer: wgpu::Buffer,
+    target_buffer: wgpu::Buffer,
+    start_nonce_buffer: wgpu::Buffer,
+    results_buffer: wgpu::Buffer,
+    dispatch_config_buffer: wgpu::Buffer,
+    staging_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+pub struct GpuEngine {
+    engine_id: usize,
+    contexts: Vec<Arc<GpuContext>>,
+    device_counter: AtomicUsize,
+    batch_size: u32,
+    throttle_ms: u64,
+}
+
+static ENGINE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+// Thread-local storage for consistent GPU device assignment per worker thread.
+// Entries are tagged with the owning engine's id so resources created for one
+// GpuEngine (and its devices) are never used with another (issue seen in benches
+// where multiple engines exist in one process).
+thread_local! {
+    static ASSIGNED_GPU_DEVICE: RefCell<Option<(usize, usize)>> = const { RefCell::new(None) };
+    static WORKER_RESOURCES: RefCell<Option<(usize, GpuResources)>> = const { RefCell::new(None) };
+    /// Engine id whose GPU device was lost/unresponsive for this worker thread.
+    static DEVICE_LOST: RefCell<Option<usize>> = const { RefCell::new(None) };
+}
+
+impl GpuContext {
+    fn create_resources(&self) -> GpuResources {
+        let bind_group_layout = self.pipeline.get_bind_group_layout(0);
+
+        // Midstate: 12 felts as LE u32 pairs
+        let midstate_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Midstate Buffer"),
+            size: 96,
+            usage: self.input_usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Target: 16 u32s
+        let target_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Target Buffer"),
+            size: 64,
+            usage: self.input_usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Start Nonce: 16 u32s
+        let start_nonce_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Start Nonce Buffer"),
+            size: 64,
+            usage: self.input_usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Results: [flag (1), nonce (16), hash (16)] = 33 u32s
+        let results_size = (1 + 16 + 16) * 4;
+        let results_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Results Buffer"),
+            size: results_size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Three dispatch words plus padding for the Apple uniform vec4 binding.
+        let dispatch_config_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Dispatch Config Buffer"),
+            size: 16,
+            usage: self.input_usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Staging Buffer"),
+            size: results_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Mining Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: results_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: midstate_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: start_nonce_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: target_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: dispatch_config_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        GpuResources {
+            midstate_buffer,
+            target_buffer,
+            start_nonce_buffer,
+            results_buffer,
+            dispatch_config_buffer,
+            staging_buffer,
+            bind_group,
+        }
+    }
+}
+
+/// Create the mining shader module without naga's runtime bounds checks and
+/// loop bounding (~9% faster kernels).
+///
+/// SAFETY: the sources are the static mining kernels compiled into this binary;
+/// every buffer access is a constant-bounded loop index into fixed-size
+/// bindings the engine itself allocates, and all loops have static bounds
+/// (verified by the component test suites against every kernel path).
+#[allow(unsafe_code)]
+fn create_trusted_shader(device: &wgpu::Device, shader_source: &str) -> wgpu::ShaderModule {
+    unsafe {
+        device.create_shader_module_trusted(
+            wgpu::ShaderModuleDescriptor {
+                label: Some("Mining Shader"),
+                source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+            },
+            wgpu::ShaderRuntimeChecks::unchecked(),
+        )
+    }
+}
+
+/// Rank backends for mining: native compute APIs first.
+fn backend_rank(backend: wgpu::Backend) -> u8 {
+    match backend {
+        wgpu::Backend::Vulkan | wgpu::Backend::Metal => 0,
+        wgpu::Backend::Dx12 => 1,
+        _ => 2,
+    }
+}
+
+/// Select which adapters to mine on, returning indices into `infos` ordered
+/// discrete-first.
+///
+/// wgpu can enumerate the same physical GPU once per backend (Vulkan + DX12 on
+/// Windows) plus CPU-emulated fallbacks such as "Microsoft Basic Render Driver".
+/// Mining on every entry causes VRAM contention and OOM (issue #61), so CPU
+/// adapters are dropped and only the best-ranked backend present is kept.
+/// Within a single backend each physical GPU appears exactly once, so rigs with
+/// multiple identical cards keep every card.
+///
+/// When discrete GPUs are present, integrated GPUs (APUs) are skipped by default
+/// to avoid resource contention and driver instability from mining on both
+/// simultaneously. Set `allow_integrated` to true to override this behavior.
+///
+/// Note: This function no longer filters integrated GPUs - that decision is made
+/// after initialization, so we can fall back to integrated if discrete fails.
+fn select_adapters(infos: &[wgpu::AdapterInfo]) -> Vec<usize> {
+    let usable: Vec<usize> = (0..infos.len())
+        .filter(|&i| {
+            if infos[i].device_type == wgpu::DeviceType::Cpu {
+                log::info!(
+                    target: "gpu_engine",
+                    "Skipping CPU-emulated adapter: {} ({:?})",
+                    infos[i].name,
+                    infos[i].backend
+                );
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    let Some(best) = usable.iter().map(|&i| backend_rank(infos[i].backend)).min() else {
+        return Vec::new();
+    };
+
+    let mut selected: Vec<usize> = usable
+        .into_iter()
+        .filter(|&i| {
+            if backend_rank(infos[i].backend) != best {
+                log::info!(
+                    target: "gpu_engine",
+                    "Skipping adapter on lower-priority backend: {} ({:?})",
+                    infos[i].name,
+                    infos[i].backend
+                );
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    // Sort discrete GPUs first, but keep all adapters for now
+    // (integrated filtering happens after init, based on what actually succeeded)
+    selected.sort_by_key(|&i| match infos[i].device_type {
+        wgpu::DeviceType::DiscreteGpu => 0,
+        wgpu::DeviceType::IntegratedGpu => 1,
+        _ => 2,
+    });
+    selected
+}
+
+/// Filter initialized GPUs based on device types.
+/// Returns indices of GPUs to keep.
+///
+/// Rules:
+/// - If any discrete GPU initialized successfully and `allow_integrated` is false,
+///   drop all integrated GPUs
+/// - Otherwise keep all GPUs
+///
+/// This is extracted as a pure function for testability.
+fn filter_initialized_gpus(
+    device_types: &[wgpu::DeviceType],
+    allow_integrated: bool,
+) -> Vec<usize> {
+    let has_discrete = device_types.contains(&wgpu::DeviceType::DiscreteGpu);
+
+    if has_discrete && !allow_integrated {
+        // Keep only discrete GPUs
+        device_types
+            .iter()
+            .enumerate()
+            .filter(|(_, &dt)| dt != wgpu::DeviceType::IntegratedGpu)
+            .map(|(i, _)| i)
+            .collect()
+    } else {
+        // Keep all
+        (0..device_types.len()).collect()
+    }
+}
+
+impl GpuEngine {
+    /// Try to initialize the GPU engine with the given batch size and throttle (ms between batches).
+    ///
+    /// # Arguments
+    /// * `batch_size` - Number of nonces per batch
+    /// * `throttle_ms` - Delay between batches in milliseconds (0 = no throttle)
+    /// * `allow_integrated` - If true, use integrated GPUs even when discrete GPUs are available
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `batch_size` is zero (no work would be performed)
+    /// - No usable GPU adapters are found
+    pub fn try_new(
+        batch_size: u32,
+        throttle_ms: u64,
+        allow_integrated: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if batch_size == 0 {
+            return Err("batch_size must be non-zero".into());
+        }
+
+        // Handle both cases: called from within a tokio runtime or from outside
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                // We're inside a tokio runtime - use block_in_place to allow blocking
+                tokio::task::block_in_place(|| {
+                    handle.block_on(Self::init(batch_size, throttle_ms, allow_integrated))
+                })
+            }
+            Err(_) => {
+                // No runtime exists - create a temporary one
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(Self::init(batch_size, throttle_ms, allow_integrated))
+            }
+        }
+    }
+
+    async fn init(
+        batch_size: u32,
+        throttle_ms: u64,
+        allow_integrated: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        log::info!(target: "gpu_engine", "Initializing WGPU...");
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..Default::default()
+        });
+
+        let adapters = instance.enumerate_adapters(wgpu::Backends::PRIMARY);
+        let infos: Vec<wgpu::AdapterInfo> = adapters.iter().map(|a| a.get_info()).collect();
+
+        let selected = select_adapters(&infos);
+        if selected.is_empty() {
+            log::error!(
+                target: "gpu_engine",
+                "No usable GPU adapters found ({} enumerated). Use --gpu-devices 0 to disable GPU mining.",
+                infos.len()
+            );
+            return Err("No usable GPU adapters found".into());
+        }
+
+        let mut adapters: Vec<Option<wgpu::Adapter>> = adapters.into_iter().map(Some).collect();
+
+        // Track successfully initialized contexts with their device type
+        struct InitializedGpu {
+            context: Arc<GpuContext>,
+            device_type: wgpu::DeviceType,
+            name: String,
+        }
+        let mut initialized: Vec<InitializedGpu> = Vec::new();
+
+        // Timeout for initializing each adapter (30 seconds should be plenty)
+        let init_timeout = std::time::Duration::from_secs(30);
+
+        for (i, idx) in selected.into_iter().enumerate() {
+            let adapter = adapters[idx].take().expect("adapter selected exactly once");
+            let info = &infos[idx];
+            log::info!(
+                target: "gpu_engine",
+                "Initializing GPU device {i}: {} ({:?}, {:?})",
+                info.name,
+                info.device_type,
+                info.backend
+            );
+            log::debug!(target: "gpu_engine", "Adapter {i} raw info: {info:?}");
+
+            let kernel = Kernel::for_adapter(&adapter);
+
+            // Try to initialize this adapter with a proper timeout.
+            // If the driver hangs, we'll skip this adapter after the timeout.
+            let device_future = adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("Mining Device"),
+                required_features: if kernel.needs_int64() {
+                    wgpu::Features::SHADER_INT64
+                } else {
+                    wgpu::Features::empty()
+                },
+                required_limits: wgpu::Limits::default(),
+                memory_hints: Default::default(),
+                ..Default::default()
+            });
+
+            let device_result = match tokio::time::timeout(init_timeout, device_future).await {
+                Ok(result) => result,
+                Err(_) => {
+                    log::warn!(
+                        target: "gpu_engine",
+                        "GPU device {i} ({}) timed out after {}s during initialization, skipping",
+                        info.name, init_timeout.as_secs()
+                    );
+                    continue;
+                }
+            };
+
+            let (device, queue) = match device_result {
+                Ok(dq) => dq,
+                Err(e) => {
+                    log::warn!(
+                        target: "gpu_engine",
+                        "Failed to initialize GPU device {i} ({}): {}. Skipping.",
+                        info.name, e
+                    );
+                    continue;
+                }
+            };
+
+            // Log device limits at debug level
+            let limits = device.limits();
+            log::debug!(target: "gpu_engine", "GPU device {i} limits: max_workgroups={}, max_workgroup_size={}x{}x{}, max_buffer={}",
+                limits.max_compute_workgroups_per_dimension,
+                limits.max_compute_workgroup_size_x,
+                limits.max_compute_workgroup_size_y,
+                limits.max_compute_workgroup_size_z,
+                limits.max_buffer_size
+            );
+
+            // Shader and pipeline creation are synchronous - can't timeout, but usually fast
+            let pipeline_start = std::time::Instant::now();
+
+            log::info!(
+                target: "gpu_engine",
+                "GPU device {i} ({}) using {} [{}]",
+                info.name,
+                kernel.label(),
+                kernel.id()
+            );
+            let shader = create_trusted_shader(&device, kernel.source());
+
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Mining Pipeline"),
+                layout: None,
+                module: &shader,
+                entry_point: Some("mining_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+            let pipeline_elapsed = pipeline_start.elapsed();
+            log::info!(
+                target: "gpu_engine",
+                "GPU device {i} ({}) initialized successfully (pipeline compiled in {:.1}s)",
+                info.name, pipeline_elapsed.as_secs_f64()
+            );
+
+            // Calculate vendor-specific configuration once during initialization
+            let optimal_workgroups = get_vendor_specific_dispatch(info, &device);
+
+            initialized.push(InitializedGpu {
+                context: Arc::new(GpuContext {
+                    device,
+                    queue,
+                    pipeline,
+                    optimal_workgroups,
+                    input_usage: if kernel == Kernel::Apple {
+                        wgpu::BufferUsages::UNIFORM
+                    } else {
+                        wgpu::BufferUsages::STORAGE
+                    },
+                }),
+                device_type: info.device_type,
+                name: info.name.clone(),
+            });
+        }
+
+        if initialized.is_empty() {
+            log::error!(target: "gpu_engine", "No GPU adapters could be initialized successfully.");
+            return Err("No GPU adapters could be initialized".into());
+        }
+
+        // Filter integrated GPUs if discrete GPUs successfully initialized
+        let device_types: Vec<_> = initialized.iter().map(|g| g.device_type).collect();
+        let keep_indices = filter_initialized_gpus(&device_types, allow_integrated);
+
+        let contexts: Vec<Arc<GpuContext>> = initialized
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, g)| {
+                if keep_indices.contains(&i) {
+                    Some(g.context)
+                } else {
+                    log::info!(
+                        target: "gpu_engine",
+                        "Dropping integrated GPU (discrete GPU initialized successfully, use --allow-integrated to override): {}",
+                        g.name
+                    );
+                    None
+                }
+            })
+            .collect();
+
+        log::info!(
+            target: "gpu_engine",
+            "GPU engine initialized with {} devices (batch size: {} nonces, throttle: {}ms)",
+            contexts.len(),
+            batch_size,
+            throttle_ms
+        );
+
+        Ok(Self {
+            engine_id: ENGINE_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
+            contexts,
+            device_counter: AtomicUsize::new(0),
+            batch_size,
+            throttle_ms,
+        })
+    }
+
+    /// Returns the number of GPU devices available
+    pub fn device_count(&self) -> usize {
+        self.contexts.len()
+    }
+
+    /// Explicitly clear thread-local GPU resources.
+    /// Call this before dropping a `GpuEngine` (or before thread exit) so
+    /// buffers are destroyed while the device is still alive — otherwise the
+    /// next engine on this thread can reuse dead buffer IDs and panic with
+    /// `Buffer[…] does not exist`.
+    pub fn clear_worker_resources() {
+        WORKER_RESOURCES.with(|resources| {
+            *resources.borrow_mut() = None;
+        });
+        ASSIGNED_GPU_DEVICE.with(|assigned| {
+            *assigned.borrow_mut() = None;
+        });
+        DEVICE_LOST.with(|lost| {
+            *lost.borrow_mut() = None;
+        });
+    }
+}
+
+impl MinerEngine for GpuEngine {
+    fn name(&self) -> &'static str {
+        "gpu-wgpu"
+    }
+
+    fn prepare_context(&self, header_hash: [u8; 32], difficulty: U512) -> JobContext {
+        JobContext::new(header_hash, difficulty)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn search_range(
+        &self,
+        ctx: &JobContext,
+        range: Range,
+        cancel: &dyn CancelCheck,
+    ) -> EngineStatus {
+        if self.contexts.is_empty() {
+            log::warn!(target: "gpu_engine", "No GPUs available for search.");
+            return EngineStatus::Exhausted { hash_count: 0 };
+        }
+
+        // Check if this worker's GPU device was previously lost (for this engine)
+        let device_is_lost = DEVICE_LOST.with(|lost| *lost.borrow() == Some(self.engine_id));
+        if device_is_lost {
+            // Device was lost in a previous call - signal worker should exit
+            return EngineStatus::DeviceLost { hash_count: 0 };
+        }
+
+        // Empty or inverted range: nothing to do.
+        if range.start > range.end {
+            return EngineStatus::Exhausted { hash_count: 0 };
+        }
+
+        // Check for pre-cancellation
+        if cancel.is_cancelled() {
+            return EngineStatus::Cancelled { hash_count: 0 };
+        }
+
+        // Use thread-local assignment for consistent worker-to-GPU mapping
+        let device_index = ASSIGNED_GPU_DEVICE.with(|assigned| {
+            let mut assigned_ref = assigned.borrow_mut();
+            match *assigned_ref {
+                Some((engine_id, index)) if engine_id == self.engine_id => index,
+                _ => {
+                    let index = if self.contexts.len() == 1 {
+                        0
+                    } else {
+                        self.device_counter.fetch_add(1, Ordering::SeqCst) % self.contexts.len()
+                    };
+                    *assigned_ref = Some((self.engine_id, index));
+                    log::info!(
+                        target: "gpu_engine",
+                        "Worker thread assigned to GPU device {} (of {} total devices)",
+                        index,
+                        self.contexts.len()
+                    );
+                    index
+                }
+            }
+        });
+
+        let gpu_ctx = &self.contexts[device_index];
+
+        // Ensure resources are initialized for this thread and belong to this engine
+        let resources = WORKER_RESOURCES.with(|resources_cell| {
+            let mut resources = resources_cell.borrow_mut();
+            match &*resources {
+                Some((engine_id, res)) if *engine_id == self.engine_id => res.clone(),
+                _ => {
+                    let res = gpu_ctx.create_resources();
+                    *resources = Some((self.engine_id, res.clone()));
+                    res
+                }
+            }
+        });
+
+        // Pre-convert target (only needs to be done once per job)
+        let target_bytes = ctx.target.to_little_endian();
+        let mut target_u32s = [0u32; 16];
+        for i in 0..16 {
+            let chunk = &target_bytes[i * 4..(i + 1) * 4];
+            target_u32s[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        gpu_ctx.queue.write_buffer(
+            &resources.target_buffer,
+            0,
+            bytemuck::cast_slice(&target_u32s),
+        );
+
+        let search_start = std::time::Instant::now();
+        let mut total_hashes: u64 = 0;
+        let mut current_start = range.start;
+        let mut batch_num = 0u64;
+
+        log::info!(
+            target: "gpu_engine",
+            "GPU {} search started: range {}..{}, batch size: {} nonces",
+            device_index,
+            format_u512(range.start),
+            format_u512(range.end),
+            self.batch_size
+        );
+
+        // Process in batches, checking for cancellation between each batch
+        while current_start <= range.end {
+            // Check for cancellation at host level BEFORE starting each batch
+            if cancel.is_cancelled() {
+                let elapsed = search_start.elapsed();
+                let hash_rate = total_hashes as f64 / elapsed.as_secs_f64();
+                log::info!(
+                    target: "gpu_engine",
+                    "GPU {} cancelled before batch {} ({} total hashes in {:.2}s, {})",
+                    device_index,
+                    batch_num,
+                    total_hashes,
+                    elapsed.as_secs_f64(),
+                    format_hashrate(hash_rate)
+                );
+                return EngineStatus::Cancelled {
+                    hash_count: total_hashes,
+                };
+            }
+
+            // Calculate batch range. The batch is additionally clamped so nonce
+            // increments never carry into the high 256 bits, which the midstate
+            // precompute (and the kernels) rely on.
+            let remaining = range
+                .end
+                .saturating_sub(current_start)
+                .saturating_add(U512::one());
+            let headroom =
+                (U512::one() << 256) - (current_start & ((U512::one() << 256) - U512::one()));
+            let cap = remaining.min(headroom);
+            let batch_size_u512 = U512::from(self.batch_size);
+            let this_batch_size: u32 = if cap > batch_size_u512 {
+                self.batch_size
+            } else {
+                // cap fits in u32 since it's <= batch_size which is u32
+                cap.low_u32()
+            };
+
+            // Run single batch
+            let batch_result =
+                run_single_batch(gpu_ctx, &resources, ctx, current_start, this_batch_size);
+
+            match batch_result {
+                BatchResult::Found {
+                    candidate,
+                    hash_count,
+                } => {
+                    total_hashes += hash_count;
+                    let elapsed = search_start.elapsed();
+                    let hash_rate = total_hashes as f64 / elapsed.as_secs_f64();
+
+                    log::debug!(
+                        target: "gpu_engine",
+                        "GPU {} found solution in batch {}! Nonce: {}, Hash: {} ({} total hashes in {:.2}s, {})",
+                        device_index,
+                        batch_num,
+                        format_u512(candidate.nonce),
+                        format_u512(candidate.hash),
+                        total_hashes,
+                        elapsed.as_secs_f64(),
+                        format_hashrate(hash_rate)
+                    );
+
+                    return EngineStatus::Found {
+                        candidate,
+                        hash_count: total_hashes,
+                        origin: FoundOrigin::GpuG1,
+                    };
+                }
+                BatchResult::NotFound { hash_count } => {
+                    total_hashes += hash_count;
+                }
+                BatchResult::DeviceLost => {
+                    // GPU device is lost/unresponsive - mark as permanently dead
+                    // and clear resources to prevent "buffer already mapped" panics
+                    DEVICE_LOST.with(|lost| *lost.borrow_mut() = Some(self.engine_id));
+                    WORKER_RESOURCES.with(|res| *res.borrow_mut() = None);
+
+                    log::error!(
+                        target: "gpu_engine",
+                        "GPU {} device lost or unresponsive - stopping worker. \
+                         This GPU will not process further batches.",
+                        device_index
+                    );
+                    return EngineStatus::DeviceLost {
+                        hash_count: total_hashes,
+                    };
+                }
+            }
+
+            // Move to next batch
+            current_start = current_start.saturating_add(U512::from(this_batch_size));
+            batch_num += 1;
+
+            // Apply throttle delay between batches (if configured and more batches remain)
+            // Sleep in small increments to remain responsive to cancellation
+            if self.throttle_ms > 0 && current_start <= range.end {
+                let sleep_interval =
+                    std::time::Duration::from_millis((self.throttle_ms / 10).max(1));
+                let mut remaining = std::time::Duration::from_millis(self.throttle_ms);
+                while remaining > std::time::Duration::ZERO {
+                    if cancel.is_cancelled() {
+                        return EngineStatus::Cancelled {
+                            hash_count: total_hashes,
+                        };
+                    }
+                    let sleep_time = remaining.min(sleep_interval);
+                    std::thread::sleep(sleep_time);
+                    remaining = remaining.saturating_sub(sleep_time);
+                }
+            }
+
+            // Log progress periodically (every 10 batches)
+            if batch_num.is_multiple_of(10) {
+                let elapsed = search_start.elapsed();
+                let hash_rate = total_hashes as f64 / elapsed.as_secs_f64();
+                log::debug!(
+                    target: "gpu_engine",
+                    "GPU {} batch {} complete: {} hashes so far ({:.2}s, {})",
+                    device_index,
+                    batch_num,
+                    total_hashes,
+                    elapsed.as_secs_f64(),
+                    format_hashrate(hash_rate)
+                );
+            }
+        }
+
+        // Range exhausted without finding solution
+        let elapsed = search_start.elapsed();
+        let hash_rate = total_hashes as f64 / elapsed.as_secs_f64();
+        log::info!(
+            target: "gpu_engine",
+            "GPU {} search exhausted: {} hashes in {} batches ({:.2}s, {})",
+            device_index,
+            total_hashes,
+            batch_num,
+            elapsed.as_secs_f64(),
+            format_hashrate(hash_rate)
+        );
+
+        EngineStatus::Exhausted {
+            hash_count: total_hashes,
+        }
+    }
+}
+
+/// Result from a single GPU batch
+enum BatchResult {
+    Found {
+        candidate: Candidate,
+        hash_count: u64,
+    },
+    NotFound {
+        hash_count: u64,
+    },
+    /// GPU device is lost or unresponsive - caller should stop using this device
+    DeviceLost,
+}
+
+/// Run a single batch of GPU computation
+fn run_single_batch(
+    gpu_ctx: &GpuContext,
+    resources: &GpuResources,
+    ctx: &JobContext,
+    batch_start: U512,
+    batch_size: u32,
+) -> BatchResult {
+    // Calculate dispatch configuration for this batch
+    let threads_per_workgroup = 256u32;
+    let limits = gpu_ctx.device.limits();
+    let max_workgroups = limits.max_compute_workgroups_per_dimension;
+
+    let hinted_workgroups = gpu_ctx.optimal_workgroups.max(1).min(max_workgroups);
+    let hinted_threads = hinted_workgroups as u64 * threads_per_workgroup as u64;
+
+    let logical_threads = (batch_size as u64).min(hinted_threads).max(1);
+    let num_workgroups = ((logical_threads as u32).div_ceil(threads_per_workgroup)).max(1);
+    let total_threads = (num_workgroups * threads_per_workgroup) as u64;
+    let nonces_per_thread = ((batch_size as u64).div_ceil(total_threads)).max(1) as u32;
+
+    // Dispatch config: [total_threads, nonces_per_thread, total_nonces]
+    let dispatch_config = [total_threads as u32, nonces_per_thread, batch_size, 0];
+
+    // Write dispatch config
+    gpu_ctx.queue.write_buffer(
+        &resources.dispatch_config_buffer,
+        0,
+        bytemuck::cast_slice(&dispatch_config),
+    );
+
+    // Write start nonce for this batch
+    let start_nonce_bytes = batch_start.to_little_endian();
+    gpu_ctx
+        .queue
+        .write_buffer(&resources.start_nonce_buffer, 0, &start_nonce_bytes);
+
+    let nonce_be = batch_start.to_big_endian();
+    let midstate_u32s =
+        pow_core::mining_midstate_u32s(ctx.header, nonce_be[..32].try_into().unwrap());
+    gpu_ctx.queue.write_buffer(
+        &resources.midstate_buffer,
+        0,
+        bytemuck::cast_slice(&midstate_u32s),
+    );
+
+    // Reset results buffer
+    const RESULTS_SIZE: usize = (1 + 16 + 16) * 4;
+    const ZEROS: [u8; RESULTS_SIZE] = [0; RESULTS_SIZE];
+    gpu_ctx
+        .queue
+        .write_buffer(&resources.results_buffer, 0, &ZEROS);
+
+    // Create and submit command buffer
+    let mut encoder = gpu_ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&gpu_ctx.pipeline);
+        cpass.set_bind_group(0, &resources.bind_group, &[]);
+        cpass.dispatch_workgroups(num_workgroups, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(
+        &resources.results_buffer,
+        0,
+        &resources.staging_buffer,
+        0,
+        RESULTS_SIZE as u64,
+    );
+
+    gpu_ctx.queue.submit(Some(encoder.finish()));
+
+    // Wait for GPU to complete (blocking)
+    let buffer_slice = resources.staging_buffer.slice(..);
+    // Use atomic to track completion: 0 = pending, 1 = success, 2 = error
+    let map_status = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let map_status_clone = map_status.clone();
+    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+        map_status_clone.store(if result.is_ok() { 1 } else { 2 }, Ordering::Release);
+    });
+
+    // Poll until complete, error, or timeout (30 seconds max to prevent infinite hang)
+    let poll_start = std::time::Instant::now();
+    let max_poll_duration = std::time::Duration::from_secs(30);
+    let final_status = loop {
+        let _ = gpu_ctx.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_millis(10)),
+        });
+
+        match map_status.load(Ordering::Acquire) {
+            1 => break 1, // Success - buffer is mapped
+            2 => {
+                // Mapping failed - buffer was never successfully mapped, don't unmap
+                log::error!(
+                    target: "gpu_engine",
+                    "GPU buffer mapping failed - possible device lost or resource error"
+                );
+                return BatchResult::DeviceLost;
+            }
+            _ => {
+                // Still pending - check timeout
+                if poll_start.elapsed() > max_poll_duration {
+                    log::error!(
+                        target: "gpu_engine",
+                        "GPU buffer mapping timed out after {}s - GPU may be unresponsive",
+                        max_poll_duration.as_secs()
+                    );
+                    // Timeout: map_async callback never fired, buffer not mapped, don't unmap
+                    return BatchResult::DeviceLost;
+                }
+            }
+        }
+    };
+
+    // Only reach here if final_status == 1 (success), buffer is mapped
+    debug_assert_eq!(final_status, 1);
+
+    // Read results
+    let data = buffer_slice.get_mapped_range();
+    let result_u32s: &[u32] = bytemuck::cast_slice(&data);
+
+    // Calculate the actual number of nonces dispatched
+    let dispatched_nonces = (total_threads * nonces_per_thread as u64).min(batch_size as u64);
+
+    if result_u32s[0] != 0 {
+        // Solution found!
+        let nonce_u32s = &result_u32s[1..17];
+        let hash_u32s = &result_u32s[17..33];
+        let nonce = U512::from_little_endian(bytemuck::cast_slice(nonce_u32s));
+        let hash = U512::from_little_endian(bytemuck::cast_slice(hash_u32s));
+        let work = nonce.to_big_endian();
+
+        // Calculate hashes computed based on GPU parallel execution model
+        let hashes_computed = if nonce >= batch_start {
+            let logical_index = (nonce - batch_start).as_u64();
+            let winning_iteration = logical_index % (nonces_per_thread as u64);
+            (total_threads * (winning_iteration + 1)).min(dispatched_nonces)
+        } else {
+            dispatched_nonces
+        };
+
+        drop(data);
+        resources.staging_buffer.unmap();
+
+        return BatchResult::Found {
+            candidate: Candidate { nonce, work, hash },
+            hash_count: hashes_computed,
+        };
+    }
+
+    drop(data);
+    resources.staging_buffer.unmap();
+
+    BatchResult::NotFound {
+        hash_count: dispatched_nonces,
+    }
+}
+
+/// Get vendor-specific optimal dispatch configuration
+fn get_vendor_specific_dispatch(adapter_info: &wgpu::AdapterInfo, device: &wgpu::Device) -> u32 {
+    let limits = device.limits();
+    let max_workgroups = limits.max_compute_workgroups_per_dimension.min(65535);
+
+    let is_metal = adapter_info.backend == wgpu::Backend::Metal;
+    let tier = gpu_tiers::detect_gpu_tier(&adapter_info.name, adapter_info.vendor, is_metal);
+
+    let optimal_workgroups = (max_workgroups / tier.workgroup_divisor).max(tier.min_workgroups);
+
+    // Log GPU detection result
+    log::info!(
+        target: "gpu_engine",
+        "GPU detected: {} | tier: {} | workgroups: {} (max: {})",
+        adapter_info.name,
+        tier.name,
+        optimal_workgroups,
+        max_workgroups
+    );
+
+    if tier.is_fallback {
+        log::warn!(
+            target: "gpu_engine",
+            "GPU not recognized, using fallback config. Please report: name='{}', vendor=0x{:04X}, device={}",
+            adapter_info.name,
+            adapter_info.vendor,
+            adapter_info.device
+        );
+        log::warn!(target: "gpu_engine", "Report at: https://github.com/Quantus-Network/quantus-miner/issues");
+    }
+
+    optimal_workgroups
+}
+
+#[cfg(test)]
+mod adapter_selection_tests {
+    use super::*;
+
+    fn info(
+        name: &str,
+        device_type: wgpu::DeviceType,
+        backend: wgpu::Backend,
+    ) -> wgpu::AdapterInfo {
+        wgpu::AdapterInfo {
+            name: name.into(),
+            vendor: 0,
+            device: 0,
+            device_type,
+            driver: String::new(),
+            driver_info: String::new(),
+            backend,
+        }
+    }
+
+    #[test]
+    fn windows_multi_backend_keeps_one_context_per_physical_gpu() {
+        // The exact enumeration from issue #61
+        let infos = [
+            info(
+                "AMD Radeon(TM) Graphics",
+                wgpu::DeviceType::IntegratedGpu,
+                wgpu::Backend::Vulkan,
+            ),
+            info(
+                "NVIDIA GeForce RTX 3070",
+                wgpu::DeviceType::DiscreteGpu,
+                wgpu::Backend::Vulkan,
+            ),
+            info(
+                "AMD Radeon(TM) Graphics",
+                wgpu::DeviceType::IntegratedGpu,
+                wgpu::Backend::Dx12,
+            ),
+            info(
+                "NVIDIA GeForce RTX 3070",
+                wgpu::DeviceType::DiscreteGpu,
+                wgpu::Backend::Dx12,
+            ),
+            info(
+                "Microsoft Basic Render Driver",
+                wgpu::DeviceType::Cpu,
+                wgpu::Backend::Dx12,
+            ),
+        ];
+        // select_adapters returns all non-CPU adapters on best backend, discrete first
+        // Integrated filtering now happens after init in the init() function
+        assert_eq!(select_adapters(&infos), vec![1, 0]);
+    }
+
+    #[test]
+    fn identical_multi_gpu_rig_keeps_every_card() {
+        let infos = [
+            info(
+                "RTX 3090",
+                wgpu::DeviceType::DiscreteGpu,
+                wgpu::Backend::Vulkan,
+            ),
+            info(
+                "RTX 3090",
+                wgpu::DeviceType::DiscreteGpu,
+                wgpu::Backend::Vulkan,
+            ),
+            info(
+                "RTX 3090",
+                wgpu::DeviceType::DiscreteGpu,
+                wgpu::Backend::Vulkan,
+            ),
+        ];
+        assert_eq!(select_adapters(&infos), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn dx12_only_machine_returns_all_adapters_sorted() {
+        let infos = [
+            info("iGPU", wgpu::DeviceType::IntegratedGpu, wgpu::Backend::Dx12),
+            info("dGPU", wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Dx12),
+        ];
+        // select_adapters returns both, discrete first (integrated filtering is post-init)
+        assert_eq!(select_adapters(&infos), vec![1, 0]);
+    }
+
+    #[test]
+    fn integrated_only_machine_keeps_integrated() {
+        // When no discrete GPU exists, integrated GPUs should be used
+        let infos = [
+            info(
+                "Intel UHD",
+                wgpu::DeviceType::IntegratedGpu,
+                wgpu::Backend::Vulkan,
+            ),
+            info(
+                "AMD Vega 8",
+                wgpu::DeviceType::IntegratedGpu,
+                wgpu::Backend::Vulkan,
+            ),
+        ];
+        assert_eq!(select_adapters(&infos), vec![0, 1]);
+    }
+
+    #[test]
+    fn software_only_environment_selects_nothing() {
+        let infos = [info(
+            "llvmpipe",
+            wgpu::DeviceType::Cpu,
+            wgpu::Backend::Vulkan,
+        )];
+        assert!(select_adapters(&infos).is_empty());
+    }
+
+    #[test]
+    fn empty_enumeration_selects_nothing() {
+        assert!(select_adapters(&[]).is_empty());
+    }
+
+    /// Exact scenario from Windows ASUS laptop with RX 560X + Vega 8 APU.
+    /// Both GPUs appear on both Vulkan and Dx12 backends.
+    /// select_adapters returns both Vulkan adapters (discrete first).
+    /// The init() function will later drop the integrated one if discrete succeeds.
+    #[test]
+    fn windows_amd_discrete_plus_apu_selects_both_on_best_backend() {
+        let infos = [
+            info(
+                "Microsoft Basic Render Driver",
+                wgpu::DeviceType::Cpu,
+                wgpu::Backend::Dx12,
+            ),
+            info(
+                "AMD Radeon(TM) Vega 8 Graphics",
+                wgpu::DeviceType::IntegratedGpu,
+                wgpu::Backend::Dx12,
+            ),
+            info(
+                "Radeon RX 560X",
+                wgpu::DeviceType::DiscreteGpu,
+                wgpu::Backend::Dx12,
+            ),
+            info(
+                "AMD Radeon(TM) Vega 8 Graphics",
+                wgpu::DeviceType::IntegratedGpu,
+                wgpu::Backend::Vulkan,
+            ),
+            info(
+                "Radeon RX 560X",
+                wgpu::DeviceType::DiscreteGpu,
+                wgpu::Backend::Vulkan,
+            ),
+        ];
+        // select_adapters returns both Vulkan adapters, discrete first
+        // - Index 0: Skipped (CPU emulated)
+        // - Index 1, 2: Skipped (Dx12 lower priority than Vulkan)
+        // - Index 4: Selected first (discrete, Vulkan)
+        // - Index 3: Selected second (integrated, Vulkan)
+        assert_eq!(select_adapters(&infos), vec![4, 3]);
+    }
+
+    // Tests for filter_initialized_gpus (post-init filtering)
+
+    #[test]
+    fn filter_discrete_present_drops_integrated() {
+        use wgpu::DeviceType::*;
+        // Discrete at index 0, integrated at index 1
+        let types = vec![DiscreteGpu, IntegratedGpu];
+        assert_eq!(filter_initialized_gpus(&types, false), vec![0]);
+    }
+
+    #[test]
+    fn filter_discrete_failed_keeps_integrated() {
+        use wgpu::DeviceType::*;
+        // Only integrated initialized (discrete failed/timed out)
+        let types = vec![IntegratedGpu];
+        assert_eq!(filter_initialized_gpus(&types, false), vec![0]);
+    }
+
+    #[test]
+    fn filter_allow_integrated_keeps_both() {
+        use wgpu::DeviceType::*;
+        let types = vec![DiscreteGpu, IntegratedGpu];
+        // With allow_integrated=true, keep both
+        assert_eq!(filter_initialized_gpus(&types, true), vec![0, 1]);
+    }
+
+    #[test]
+    fn filter_multiple_discrete_keeps_all_discrete() {
+        use wgpu::DeviceType::*;
+        let types = vec![DiscreteGpu, DiscreteGpu, IntegratedGpu];
+        // Drops integrated, keeps both discrete
+        assert_eq!(filter_initialized_gpus(&types, false), vec![0, 1]);
+    }
+
+    #[test]
+    fn filter_only_discrete_keeps_all() {
+        use wgpu::DeviceType::*;
+        let types = vec![DiscreteGpu, DiscreteGpu];
+        assert_eq!(filter_initialized_gpus(&types, false), vec![0, 1]);
+    }
+
+    #[test]
+    fn filter_multiple_integrated_no_discrete_keeps_all() {
+        use wgpu::DeviceType::*;
+        let types = vec![IntegratedGpu, IntegratedGpu];
+        // No discrete, so keep all integrated
+        assert_eq!(filter_initialized_gpus(&types, false), vec![0, 1]);
+    }
+}

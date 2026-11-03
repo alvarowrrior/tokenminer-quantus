@@ -1,0 +1,5 @@
+* text=auto
+*.ptx -text
+*.cu -text
+*.cuh -text
+*.ps1 text eol=crlf

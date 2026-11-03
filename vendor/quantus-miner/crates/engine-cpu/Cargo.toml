@@ -1,0 +1,27 @@
+[package]
+name = "engine-cpu"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "CPU mining engine implementation for the Quantus External Miner"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[features]
+# Default to the baseline/reference implementation; enable others as needed.
+default = ["baseline"]
+
+# Map engine features to pow-core features so engine-cpu consumers can toggle them.
+baseline = ["pow-core/baseline"]
+simd-poseidon2 = ["pow-core/simd-poseidon2"]
+
+[dependencies]
+pow-core = { path = "../pow-core" }
+primitive-types = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+criterion = "0.5"
+rand = { workspace = true, features = ["std", "std_rng"] }

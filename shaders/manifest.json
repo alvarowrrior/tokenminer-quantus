@@ -1,0 +1,97 @@
+{
+ "nvrtc": "12.8",
+ "kernels": {
+  "quantus-cuda-q106-red6-compute_120.ptx": {
+   "source": "quantus-cuda-q106-red6pos6.cu",
+   "arch": "compute_120",
+   "source_sha256": "4f120dc3cf6e779dd5813d4004a8465a1b1f127d0f86bdf0c58f8301996d330c",
+   "headers": {},
+   "options": [
+    "--gpu-architecture=compute_120",
+    "--std=c++17",
+    "-DSPARSE_KIND=2"
+   ],
+   "image_sha256": "51be9fd24627f70f700cda4540d78b2e42fdc547bfe448958fe10208c75f4cdd",
+   "bytes": 3681234
+  },
+  "quantus-cuda-q106-red6-compute_52.ptx": {
+   "source": "quantus-cuda-q106-red6pos6.cu",
+   "arch": "compute_52",
+   "source_sha256": "4f120dc3cf6e779dd5813d4004a8465a1b1f127d0f86bdf0c58f8301996d330c",
+   "headers": {},
+   "options": [
+    "--gpu-architecture=compute_52",
+    "--std=c++17",
+    "-DSPARSE_KIND=2"
+   ],
+   "image_sha256": "c78d416ae72ce4284ff4d1ab31d5f36615f4c0ddb4b5ff751a6ce3d22fa6576a",
+   "bytes": 3541179
+  },
+  "quantus-cuda-exact-compute_120.ptx": {
+   "source": "quantus-cuda-exact.cu",
+   "arch": "compute_120",
+   "source_sha256": "5e497e0cd081d537d88d399dc528eb166ea3d80a31ab67e1d90e896f7554eb56",
+   "headers": {
+    "quantus-cuda-constants.cuh": "bd0c7e64b5338ef6c5ede4121b4ecf4a4a5de3437e2bce8faded03cb6fe0d801"
+   },
+   "options": [
+    "--gpu-architecture=compute_120",
+    "--std=c++17",
+    "-DSPARSE_KIND=2",
+    "-Ishaders"
+   ],
+   "image_sha256": "6d36160bc8d4e31122750c2f0fdb41b3b1627980477d1bf3ab67c065f2e68467",
+   "bytes": 1309280
+  },
+  "quantus-cuda-exact-compute_52.ptx": {
+   "source": "quantus-cuda-exact.cu",
+   "arch": "compute_52",
+   "source_sha256": "5e497e0cd081d537d88d399dc528eb166ea3d80a31ab67e1d90e896f7554eb56",
+   "headers": {
+    "quantus-cuda-constants.cuh": "bd0c7e64b5338ef6c5ede4121b4ecf4a4a5de3437e2bce8faded03cb6fe0d801"
+   },
+   "options": [
+    "--gpu-architecture=compute_52",
+    "--std=c++17",
+    "-DSPARSE_KIND=2",
+    "-Ishaders"
+   ],
+   "image_sha256": "5196eb43ba3ef4d58f77eb27785379de28b484e86bef86957d1be6a10c5b64c4",
+   "bytes": 1421760
+  },
+  "quantus-cuda-internal-compute_120.ptx": {
+   "source": "quantus-cuda-internal.cu",
+   "arch": "compute_120",
+   "source_sha256": "c8bbf6e82e011ffcfdcda9cee146e563a2b2f12b758b6ca6ff6e79b2a978d9ea",
+   "headers": {
+    "quantus-cuda-constants.cuh": "bd0c7e64b5338ef6c5ede4121b4ecf4a4a5de3437e2bce8faded03cb6fe0d801"
+   },
+   "options": [
+    "--gpu-architecture=compute_120",
+    "--std=c++17",
+    "-DSPARSE_KIND=2",
+    "-DQUANTUS_VARIANT=2",
+    "-Ishaders"
+   ],
+   "image_sha256": "d7f2bc07bb4659eb8efda3c5f8a882534c4259e923f9b2ea82560f1ea1e7207f",
+   "bytes": 895681
+  },
+  "quantus-cuda-internal-compute_52.ptx": {
+   "source": "quantus-cuda-internal.cu",
+   "arch": "compute_52",
+   "source_sha256": "c8bbf6e82e011ffcfdcda9cee146e563a2b2f12b758b6ca6ff6e79b2a978d9ea",
+   "headers": {
+    "quantus-cuda-constants.cuh": "bd0c7e64b5338ef6c5ede4121b4ecf4a4a5de3437e2bce8faded03cb6fe0d801"
+   },
+   "options": [
+    "--gpu-architecture=compute_52",
+    "--std=c++17",
+    "-DSPARSE_KIND=2",
+    "-DQUANTUS_VARIANT=2",
+    "-Ishaders"
+   ],
+   "image_sha256": "1793b4496c6918bc748e10546953e947772042bbd91b7a915354d4bc206660f6",
+   "bytes": 898472
+  }
+ }
+}
