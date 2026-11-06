@@ -64,11 +64,15 @@ impl QuantusCuda {
         Self::new_variant(capacity, &variant)
     }
     pub fn new_variant(capacity: u32, variant: &str) -> Result<Self, Error> {
+        Self::new_variant_en(0, capacity, variant)
+    }
+    /// Como `new_variant`, en la GPU `dispositivo` (orden de CUDA). Cada GPU lleva su propio motor.
+    pub fn new_variant_en(dispositivo: usize, capacity: u32, variant: &str) -> Result<Self, Error> {
         if capacity == 0 || capacity > MAX_RETURNED as u32 {
             return Err("Capacidad Quantus incorrecta".into());
         }
-        let context =
-            CudaContext::new(0).map_err(|e| format!("Quantus CUDA driver/context: {e}"))?;
+        let context = CudaContext::new(dispositivo)
+            .map_err(|e| format!("Quantus CUDA driver/context: {e}"))?;
         let major = context
             .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
         let minor = context

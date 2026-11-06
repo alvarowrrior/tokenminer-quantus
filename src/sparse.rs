@@ -109,10 +109,14 @@ pub struct SparseCuda {
 }
 impl SparseCuda {
     pub fn new(capacity: u32, kind: &str) -> Result<Self, Error> {
+        Self::new_en(0, capacity, kind)
+    }
+    /// Como `new`, en la GPU `dispositivo` (orden de CUDA).
+    pub fn new_en(dispositivo: usize, capacity: u32, kind: &str) -> Result<Self, Error> {
         if kind != "q106" {
             return Err("Variante dispersa incorrecta".into());
         }
-        let mut base = QuantusCuda::new_variant(capacity, "internal")?;
+        let mut base = QuantusCuda::new_variant_en(dispositivo, capacity, "internal")?;
         // RTX 50 (SM120): PTX ajustado. Resto: PTX genérico compute_52 desde las mismas fuentes.
         let source = if base.generic {
             include_str!("../shaders/quantus-cuda-q106-red6-compute_52.ptx")
