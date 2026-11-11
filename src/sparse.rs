@@ -96,6 +96,14 @@ fn power7(x: u64) -> u64 {
     let x4 = x2 * x2 % p;
     ((x4 * x2 % p) * x % p) as u64
 }
+/// Hilos por bloque para un kernel que admite `max` en esta GPU: warps enteros, hasta 1.024. Los registros de un
+/// multiprocesador se reparten entre los hilos que tiene dentro, así que el bloque más grande que cabe es el que lo
+/// llena. Antes sólo se elegía entre 1.024 y 512: con 72 registros por hilo caben 910, y con 512 se quedaba un solo
+/// bloque por multiprocesador, medio vacío (en una RTX 5070 portátil, 17 warps rinden un 12 % menos que 32); y con más
+/// de 128 registros no caben ni 512, y el kernel no arrancaba.
+fn hilos_por_bloque(max: i32) -> u32 {
+    (max.clamp(32, 1024) as u32) / 32 * 32
+}
 pub struct SparseCuda {
     base: QuantusCuda,
     // El kernel lee la caché de 14 palabras de la constante de módulo Q61_PRE, no del puntero `pre`.
@@ -129,15 +137,16 @@ impl SparseCuda {
         if module.get_global("Q61_PRE", &base.stream)?.len() != 14 * 8 {
             return Err("Q61_PRE con tamaño inesperado".into());
         }
-        // Bloques de 1.024 hilos si todos los kernels que se lanzan con este tamaño (minado, hashes del autocheck y
-        // primera ronda) lo admiten en esta GPU por registros; si no, 512.
+        // El bloque más grande que admiten en esta GPU todos los kernels que se lanzan con este tamaño (minado, hashes
+        // del autocheck y primera ronda). El driver lo fija según los registros que da a cada hilo, y eso cambia de
+        // una GPU a otra.
         let max_of = |f: &CudaFunction| {
             f.get_attribute(sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK)
         };
         let max_threads = max_of(&base.mine_fn)?
             .min(max_of(&base.hash_fn)?)
             .min(max_of(&module.load_function("quantus_sparse_first")?)?);
-        base.threads_per_block = if max_threads >= 1024 { 1024 } else { 512 };
+        base.threads_per_block = hilos_por_bloque(max_threads);
         base.max_batch = SPARSE_BATCH;
         base.variant = format!("sparse-{kind}");
         base.pre = base.stream.alloc_zeros(24)?;
@@ -281,6 +290,53 @@ mod tests {
         let mut bad = nonce([0; 32], 0, 0).unwrap();
         bad[63] ^= 1;
         assert!(inverse(bad).is_err());
+    }
+    #[test]
+    fn el_bloque_llena_el_multiprocesador_en_cualquier_gpu() {
+        // 64 registros o menos por hilo: caben 1.024, como en la RTX 50.
+        assert_eq!(hilos_por_bloque(1024), 1024);
+        assert_eq!(hilos_por_bloque(2048), 1024);
+        // 72 registros: caben 910, que son 28 warps enteros. Antes, 512.
+        assert_eq!(hilos_por_bloque(910), 896);
+        // Más de 128 registros: no caben 512, que antes se lanzaban igual y fallaban.
+        assert_eq!(hilos_por_bloque(508), 480);
+        assert_eq!(hilos_por_bloque(512), 512);
+        assert_eq!(hilos_por_bloque(40), 32);
+        assert_eq!(hilos_por_bloque(1), 32);
+    }
+    // Ningún nonce válido se pierde y todo candidato cumple el filtro de 64 bits, con el bloque de esta GPU y con
+    // bloques más pequeños, como los que tocan en una GPU cuyo driver da más registros a cada hilo.
+    #[test]
+    #[ignore = "Requires an NVIDIA GPU; run serially"]
+    fn exacto_con_bloques_que_no_son_potencia_de_dos() {
+        let mut gpu = SparseCuda::new(256, "q106").unwrap();
+        let propio = gpu.base.threads_per_block;
+        for hilos in [896u32, 544, 480, 32] {
+            if hilos > propio {
+                continue;
+            }
+            gpu.base.threads_per_block = hilos;
+            gpu.self_check().unwrap();
+            let (header, upper, target) = ([0x3c; 32], [0x5a; 32], U512::MAX >> 6);
+            gpu.prepare(header, upper, 12345, target).unwrap();
+            // Un lote que no es múltiplo del bloque: el último queda a medias.
+            let count = 65_537u32;
+            let found = gpu.mine(7, count).unwrap().indices;
+            let mut valid = 0;
+            for i in 0..count {
+                let hash = pow_core::get_nonce_hash(header, gpu.nonce(7 + i as u64).unwrap());
+                let returned = found.binary_search(&i).is_ok();
+                if hash < target {
+                    assert!(returned, "nonce válido perdido con bloques de {hilos}: local {}", 7 + i as u64);
+                    valid += 1;
+                }
+                if returned {
+                    assert!(hash >> 448 <= target >> 448, "candidato fuera del filtro con bloques de {hilos}");
+                }
+            }
+            assert!(valid > 0 && found.len() >= valid);
+            eprintln!("bloques de {hilos}: {} candidatos, {valid} válidos full512", found.len());
+        }
     }
     // Ningún nonce válido se pierde y todo candidato cumple el filtro de 64 bits.
     // Target ~1/64 por los 64 bits altos: ~1.000 candidatos por 65.536 nonces (fuerza el desbordamiento de cola 256).
